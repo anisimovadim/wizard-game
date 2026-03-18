@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Echoes: Elemental Master - Collision System</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: 'Segoe UI', Tahoma, sans-serif; }
+        #blocker, #pause-screen {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background-color: rgba(0,0,0,0.8); display: flex; align-items: center; 
+            justify-content: center; color: white; text-align: center; z-index: 100; cursor: pointer;
+        }
+        #pause-screen { display: none; background-color: rgba(0,0,0,0.6); cursor: default; }
+        .pause-content { background: rgba(20,20,20,0.9); padding: 40px; border-radius: 20px; border: 2px solid #555; }
+        
+        #ui-layer {
+            position: absolute; bottom: 30px; left: 30px; color: white;
+            background: rgba(0,0,0,0.7); padding: 20px; border-radius: 15px;
+            border: 1px solid #444; pointer-events: none; min-width: 250px;
+        }
+        #score-layer {
+            position: absolute; top: 30px; right: 30px; color: #fff;
+            font-size: 24px; font-weight: bold; text-shadow: 0 0 10px #ff0000;
+            background: rgba(0,0,0,0.5); padding: 10px 20px; border-radius: 10px;
+        }
+        .hp-main {
+            position: absolute; top: 20px; left: 50%; transform: translateX(-50%);
+            width: 400px; height: 12px; background: #222; border: 2px solid #fff; border-radius: 10px; overflow: hidden;
+        }
+        #hp-fill { width: 100%; height: 100%; background: linear-gradient(90deg, #ff416c, #ff4b2b); transition: 0.1s; }
+        #crosshair {
+            position: absolute; top: 50%; left: 50%; width: 16px; height: 16px;
+            transform: translate(-50%, -50%); pointer-events: none; z-index: 5;
+        }
+        #crosshair::before, #crosshair::after { content: ''; position: absolute; background: rgba(255,255,255,0.8); }
+        #crosshair::before { top: 50%; left: 0; width: 100%; height: 2px; transform: translateY(-50%); }
+        #crosshair::after { left: 50%; top: 0; width: 2px; height: 100%; transform: translateX(-50%); }
+        
+        .active-val { font-weight: bold; text-shadow: 0 0 8px currentColor; font-size: 1.2em; }
+        .key-hint { display: inline-block; padding: 1px 5px; background: #333; border-radius: 3px; font-size: 11px; margin: 0 2px; }
+        #status-msg { font-size: 14px; color: #ffd700; margin-top: 5px; height: 20px; font-weight: bold; }
+        
+        button { 
+            padding: 10px 25px; font-size: 18px; background: #ff4400; color: white; 
+            border: none; border-radius: 5px; cursor: pointer; margin-top: 20px;
+            transition: 0.3s;
+        }
+        button:hover { background: #ff6622; transform: scale(1.1); }
+    </style>
+</head>
+<body>
+
+<div id="blocker">
+    <div>
+        <h1 style="letter-spacing: 7px;">ELEMENTAL MASTER</h1>
+        <p>Кликни, чтобы начать</p>
+        <p style="font-size: 14px; color: #aaa;">
+            <span class="key-hint">1-4</span> Стихии | <span class="key-hint">P</span> Пауза
+        </p>
+        <p style="font-size: 12px; color: #ffffff;">ТЕПЕРЬ ДЕРЕВЬЯ - ТВЕРДЫЕ ОБЪЕКТЫ!</p>
+    </div>
+</div>
+
+<div id="pause-screen">
+    <div class="pause-content">
+        <h2 style="font-size: 40px; margin: 0 0 20px 0;">ПАУЗА</h2>
+        <p>Игра приостановлена</p>
+        <button onclick="togglePause()">ВЕРНУТЬСЯ В БОЙ</button>
+    </div>
+</div>
+
+<div id="crosshair"></div>
+<div class="hp-main"><div id="hp-fill"></div></div>
+<div id="score-layer">УБИТО: <span id="kill-count">0</span></div>
+
+<div id="ui-layer">
+    <div style="margin-bottom: 5px;">СТИХИЯ:</div>
+    <div id="val-matter" class="active-val" style="color: #ff4400;">ОГОНЬ</div>
+    <div id="status-msg"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/PointerLockControls.js"></script>
+
+<script>
+    let isPaused = false;
+    let isDead = false;
+
+    // --- ШЕЙДЕРЫ ОКРУЖЕНИЯ ---
+    const environmentVertex = `
+        varying vec3 vNormal;
+        varying vec3 vWorldPosition;
+        varying vec2 vUv;
+        void main() {
+            vUv = uv;
+            vNormal = normalize(normalMatrix * normal);
+            vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+            vWorldPosition = worldPosition.xyz;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+    `;
+
+    const groundFragment = `
+        uniform vec3 sunDirection; uniform vec3 sunColor;
+        uniform vec3 groundColorMain; uniform vec3 groundColorAccent;
+        varying vec3 vNormal; varying vec2 vUv;
+        float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+        float noise(vec2 p) {
+            vec2 i = floor(p); vec2 f = fract(p);
+            f = f*f*(3.0-2.0*f);
+            return mix(mix(hash(i + vec2(0,0)), hash(i + vec2(1,0)), f.x),
+                       mix(hash(i + vec2(0,1)), hash(i + vec2(1,1)), f.x), f.y);
+        }
+        void main() {
+            float n = noise(vUv * 20.0);
+            vec3 baseColor = mix(groundColorMain, groundColorAccent, n);
+            float diff = max(dot(vNormal, normalize(sunDirection)), 0.0);
+            gl_FragColor = vec4(baseColor * 0.3 + diff * sunColor * baseColor, 1.0);
+        }
+    `;
+
+    // --- ИНИЦИАЛИЗАЦИЯ ---
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0xaaccff, 0.006); 
+
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 2000);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    // --- НЕБО ---
+    const skyGeo = new THREE.SphereGeometry(1000, 32, 15);
+    const skyMat = new THREE.ShaderMaterial({
+        vertexShader: `varying vec3 vPos; void main() { vPos = (modelMatrix * vec4(position, 1.0)).xyz; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+        fragmentShader: `uniform vec3 top; uniform vec3 bot; varying vec3 vPos; void main() { float h = normalize(vPos + 33.0).y; gl_FragColor = vec4(mix(bot, top, max(pow(max(h, 0.0), 0.6), 0.0)), 1.0); }`,
+        uniforms: { top: { value: new THREE.Color(0x0077ff) }, bot: { value: new THREE.Color(0xaaccff) } },
+        side: THREE.BackSide
+    });
+    scene.add(new THREE.Mesh(skyGeo, skyMat));
+
+    // --- УПРАВЛЕНИЕ ---
+    const controls = new THREE.PointerLockControls(camera, document.body);
+    
+    document.getElementById('blocker').addEventListener('click', () => controls.lock());
+
+    controls.addEventListener('lock', () => {
+        document.getElementById('blocker').style.display = 'none';
+        document.getElementById('pause-screen').style.display = 'none';
+        isPaused = false;
+    });
+
+    controls.addEventListener('unlock', () => {
+        if (!isPaused && !isDead) document.getElementById('blocker').style.display = 'flex';
+    });
+
+    function togglePause() {
+        if (isDead) return;
+        isPaused = !isPaused;
+        if (isPaused) {
+            controls.unlock();
+            document.getElementById('pause-screen').style.display = 'flex';
+            document.getElementById('blocker').style.display = 'none';
+        } else {
+            controls.lock();
+        }
+    }
+
+    const player = new THREE.Group();
+    player.position.set(0, 2, 0); 
+    player.add(camera);
+    scene.add(player);
+
+    // --- СВЕТ (СОЛНЦЕ) ---
+    scene.add(new THREE.HemisphereLight(0xbbddff, 0x332211, 0.6));
+    const sunColor = new THREE.Color(0xfff5ee);
+    const sunPos = new THREE.Vector3(50, 100, 50);
+    const sun = new THREE.DirectionalLight(sunColor, 1.2);
+    sun.position.copy(sunPos); sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    scene.add(sun);
+    
+    const magicFlash = new THREE.PointLight(0xffffff, 0, 20);
+    player.add(magicFlash);
+
+    // --- МИР И КОЛЛИЗИИ ---
+    const treeObjects = []; // Массив для проверки столкновений
+
+    const groundGeo = new THREE.PlaneGeometry(500, 500, 10, 10);
+    const shaderGroundMat = new THREE.ShaderMaterial({
+        vertexShader: environmentVertex, fragmentShader: groundFragment,
+        uniforms: { sunDirection: { value: sunPos.clone().normalize() }, sunColor: { value: sunColor },
+                    groundColorMain: { value: new THREE.Color(0x1a2a1a) }, groundColorAccent: { value: new THREE.Color(0x2d3a2d) } }
+    });
+    const ground = new THREE.Mesh(groundGeo, shaderGroundMat);
+    ground.rotation.x = -Math.PI/2; ground.receiveShadow = true;
+    scene.add(ground);
+
+    function createTree(x, z) {
+        const tree = new THREE.Group();
+        const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.4, 4), new THREE.MeshStandardMaterial({ color: 0x3d2b1d }));
+        trunk.position.y = 2; trunk.castShadow = true;
+        const leaves = new THREE.Mesh(new THREE.IcosahedronGeometry(2.5, 0), new THREE.MeshStandardMaterial({ color: 0x2e8b57 }));
+        leaves.position.y = 5.5; leaves.castShadow = true;
+        tree.add(trunk, leaves); tree.position.set(x, 0, z);
+        scene.add(tree);
+        treeObjects.push(tree); // Добавляем в список коллизий
+    }
+    for(let i=0; i<40; i++) {
+        const rx = (Math.random()-0.5)*250; const rz = (Math.random()-0.5)*250;
+        if(Math.sqrt(rx*rx+rz*rz)>15) createTree(rx, rz);
+    }
+
+    // Функция проверки столкновения игрока с объектами
+    function checkPlayerCollision(targetPos) {
+        const playerRadius = 0.8; 
+        for(let tree of treeObjects) {
+            const dist = new THREE.Vector2(targetPos.x - tree.position.x, targetPos.z - tree.position.z).length();
+            if(dist < (playerRadius + 0.3)) return true; // 0.3 - радиус ствола
+        }
+        return false;
+    }
+
+    // --- СИСТЕМА СТИХИЙ ---
+    const ELEMENTS = {
+        'ОГОНЬ': { color: 0xff4400, speed: 1.6, size: 0.35, damage: 25 },
+        'ЛЕД':   { color: 0x00ccff, speed: 1.3, size: 0.30, damage: 15 },
+        'ЗЕМЛЯ': { color: 0x8b4513, speed: 1.0, size: 0.55, damage: 35 },
+        'ВОЗДУХ':{ color: 0xffffff, speed: 3.2, size: 0.20, damage: 5 }
+    };
+    let currentElement = 'ОГОНЬ';
+    let kills = 0;
+
+    window.addEventListener('keydown', (e) => {
+        const elementKeys = {'1':'ОГОНЬ', '2':'ЛЕД', '3':'ЗЕМЛЯ', '4':'ВОЗДУХ'};
+        if(elementKeys[e.key]) {
+            currentElement = elementKeys[e.key];
+            const ui = document.getElementById('val-matter');
+            ui.innerText = currentElement;
+            ui.style.color = '#' + ELEMENTS[currentElement].color.toString(16).padStart(6, '0');
+        }
+        if(e.code === 'KeyP') togglePause();
+    });
+
+    // --- ЛЯГУШКИ ---
+    function createHPBar() {
+        const canvas = document.createElement('canvas'); canvas.width = 128; canvas.height = 16;
+        const ctx = canvas.getContext('2d');
+        const texture = new THREE.CanvasTexture(canvas);
+        const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture, depthTest: false }));
+        sprite.scale.set(1.8, 0.2, 1);
+        return { sprite, ctx, texture };
+    }
+
+    function createFrog() {
+        const frog = new THREE.Group();
+        const bodyMat = new THREE.MeshStandardMaterial({ color: 0x3d6e3d });
+        const body = new THREE.Mesh(new THREE.SphereGeometry(0.8, 12, 12), bodyMat);
+        body.scale.set(1.2, 0.8, 1); body.castShadow = true;
+        frog.add(body);
+        const head = new THREE.Mesh(new THREE.SphereGeometry(0.5, 12, 12), bodyMat);
+        head.position.set(0, 0.4, 0.6); frog.add(head);
+        const eyeGeo = new THREE.SphereGeometry(0.15, 8, 8);
+        const eyeMat = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+        const eyeL = new THREE.Mesh(eyeGeo, eyeMat); eyeL.position.set(0.25, 0.6, 0.9);
+        const eyeR = new THREE.Mesh(eyeGeo, eyeMat); eyeR.position.set(-0.25, 0.6, 0.9);
+        frog.add(eyeL, eyeR);
+
+        const auraGeo = new THREE.RingGeometry(0.9, 1.1, 16);
+        const auraMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0, side: THREE.DoubleSide });
+        const aura = new THREE.Mesh(auraGeo, auraMat);
+        aura.rotation.x = -Math.PI/2; aura.position.y = -0.4;
+        frog.add(aura);
+
+        const hpUI = createHPBar(); hpUI.sprite.position.y = 2.2; frog.add(hpUI.sprite);
+        
+        frog.position.set((Math.random()-0.5)*180, 0.5, (Math.random()-0.5)*180);
+        frog.userData = { 
+            hp: 150, maxHP: 150, hpUI: hpUI, aura: aura,
+            status: 'NONE', statusTimer: 0,
+            vy: 0, onGround: true, jumpTimer: 3, isDead: false,
+            jumpVel: new THREE.Vector3() 
+        };
+        scene.add(frog);
+        return frog;
+    }
+
+    let monsters = Array.from({ length: 15 }, createFrog);
+    const projectiles = [];
+
+    // --- ВЫСТРЕЛ ---
+    window.addEventListener('mousedown', (e) => {
+        if(!controls.isLocked || e.button !== 0 || isPaused) return;
+        const el = ELEMENTS[currentElement];
+        magicFlash.color.set(el.color); magicFlash.intensity = 2;
+        setTimeout(() => magicFlash.intensity = 0, 100);
+
+        const dir = new THREE.Vector3(); camera.getWorldDirection(dir);
+        const p = new THREE.Mesh(new THREE.SphereGeometry(el.size, 8, 8), new THREE.MeshBasicMaterial({ color: el.color }));
+        p.position.copy(player.position).add(dir.clone().multiplyScalar(1.2));
+        p.userData = { v: dir.multiplyScalar(el.speed), life: 100, element: currentElement };
+        scene.add(p); projectiles.push(p);
+    });
+
+    // --- ЦИКЛ ИГРЫ ---
+    const keys = {};
+    window.onkeydown = (e) => { if(!isPaused) keys[e.code] = true; };
+    window.onkeyup = (e) => keys[e.code] = false;
+    const clock = new THREE.Clock();
+    let playerHP = 100;
+
+    function showStatus(txt) {
+        const el = document.getElementById('status-msg');
+        el.innerText = txt;
+        setTimeout(() => { if(el.innerText === txt) el.innerText = ''; }, 2000);
+    }
+
+    function animate() {
+        requestAnimationFrame(animate);
+        if (isPaused) { renderer.render(scene, camera); return; }
+
+        const dt = clock.getDelta();
+
+        // ДВИЖЕНИЕ С ПРОВЕРКОЙ КОЛЛИЗИЙ
+        if (controls.isLocked) {
+            const speed = 12 * dt;
+            const forward = new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion); forward.y = 0;
+            const right = new THREE.Vector3(1,0,0).applyQuaternion(camera.quaternion); right.y = 0;
+            
+            let moveDir = new THREE.Vector3(0,0,0);
+            if(keys['KeyW']) moveDir.add(forward);
+            if(keys['KeyS']) moveDir.sub(forward);
+            if(keys['KeyA']) moveDir.sub(right);
+            if(keys['KeyD']) moveDir.add(right);
+
+            if (moveDir.length() > 0) {
+                moveDir.normalize().multiplyScalar(speed);
+                const nextPos = player.position.clone().add(moveDir);
+                // Проверяем коллизию перед тем как передвинуть
+                if (!checkPlayerCollision(nextPos)) {
+                    player.position.copy(nextPos);
+                }
+            }
+        }
+
+        // Пули
+        for(let i = projectiles.length - 1; i >= 0; i--) {
+            const p = projectiles[i]; p.position.add(p.userData.v); p.userData.life--;
+            for(let m of monsters) {
+                if(!m.userData.isDead && p.position.distanceTo(m.position) < 2.0) {
+                    let finalDmg = ELEMENTS[p.userData.element].damage;
+                    
+                    if (p.userData.element === 'ВОЗДУХ') {
+                        const knockbackDir = new THREE.Vector3().subVectors(m.position, player.position).normalize();
+                        m.userData.jumpVel.add(knockbackDir.multiplyScalar(0.8));
+                        m.userData.vy = 0.2; m.userData.onGround = false;
+                        showStatus("ОТБРАСЫВАНИЕ!");
+                        if (m.userData.status === 'FROZEN') m.userData.statusTimer += 2.0;
+                    }
+                    else if (m.userData.status === 'BURNING' && p.userData.element === 'ЗЕМЛЯ') {
+                        finalDmg += 60; m.userData.status = 'NONE'; showStatus("ОКАМЕНЕНИЕ!");
+                    }
+                    else if (m.userData.status === 'FROZEN' && p.userData.element === 'ОГОНЬ') {
+                        finalDmg *= 2.5; m.userData.status = 'NONE'; showStatus("ТЕРМИЧЕСКИЙ ШОК!");
+                    }
+                    else if (p.userData.element === 'ЛЕД') {
+                        m.userData.status = 'FROZEN'; m.userData.statusTimer = 5.0;
+                        m.userData.aura.material.color.set(0x00ccff);
+                    }
+                    else if (p.userData.element === 'ОГОНЬ') {
+                        m.userData.status = 'BURNING'; m.userData.statusTimer = 5.0;
+                        m.userData.aura.material.color.set(0xff4400);
+                    }
+                    m.userData.hp -= finalDmg; p.userData.life = 0;
+                }
+            }
+            if(p.userData.life <= 0) { scene.remove(p); projectiles.splice(i, 1); }
+        }
+
+        // Монстры
+        monsters.forEach(m => {
+            if(m.userData.isDead) return;
+
+            if (m.userData.statusTimer > 0) {
+                m.userData.statusTimer -= dt;
+                m.userData.aura.material.opacity = 0.8;
+                if (m.userData.status === 'BURNING') m.userData.hp -= 2 * dt;
+            } else {
+                m.userData.status = 'NONE'; m.userData.aura.material.opacity = 0;
+            }
+
+            const pct = Math.max(0, m.userData.hp / m.userData.maxHP);
+            m.userData.hpUI.ctx.clearRect(0,0,128,16);
+            m.userData.hpUI.ctx.fillStyle = '#222'; m.userData.hpUI.ctx.fillRect(0,0,128,16);
+            if (m.userData.status === 'FROZEN') m.userData.hpUI.ctx.fillStyle = '#00ccff';
+            else if (m.userData.status === 'BURNING') m.userData.hpUI.ctx.fillStyle = '#ff4400';
+            else m.userData.hpUI.ctx.fillStyle = (pct > 0.4 ? '#00ff00' : '#ff0000');
+            m.userData.hpUI.ctx.fillRect(0,0,128*pct,16); m.userData.hpUI.texture.needsUpdate = true;
+
+            if(m.userData.onGround) {
+                m.userData.jumpVel.multiplyScalar(0.9);
+                if (m.userData.status !== 'FROZEN') {
+                    m.userData.jumpTimer -= dt;
+                    if(m.userData.jumpTimer <= 0) {
+                        m.userData.vy = 0.3; m.userData.onGround = false; m.userData.jumpTimer = 2+Math.random()*2;
+                        m.userData.jumpVel = new THREE.Vector3().subVectors(player.position, m.position).normalize().multiplyScalar(0.22);
+                    }
+                }
+            } else {
+                m.userData.vy -= 0.015; m.position.y += m.userData.vy; m.position.add(m.userData.jumpVel);
+                if(m.position.y <= 0.5) { m.userData.onGround = true; m.position.y = 0.5; }
+            }
+            m.lookAt(player.position.x, 0.5, player.position.z);
+            
+            if(m.position.distanceTo(player.position) < 2.8) {
+                playerHP -= 20 * dt;
+                document.getElementById('hp-fill').style.width = playerHP + "%";
+            }
+
+            if(m.userData.hp <= 0) {
+                m.userData.isDead = true; m.userData.hpUI.sprite.visible = false; m.rotation.z = Math.PI;
+                kills++; document.getElementById('kill-count').innerText = kills;
+                setTimeout(() => {
+                    scene.remove(m); monsters.splice(monsters.indexOf(m), 1);
+                    monsters.push(createFrog());
+                }, 2000);
+            }
+        });
+
+        if(playerHP <= 0 && !isDead) { isDead = true; alert("КОНЕЦ ИГРЫ. УБИТО: " + kills); location.reload(); }
+        renderer.render(scene, camera);
+    }
+    animate();
+    window.onresize = () => { camera.aspect = window.innerWidth/window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); };
+</script>
+</body>
+</html>
